@@ -1,0 +1,171 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
+
+# =========================
+# PAGE CONFIG
+# =========================
+st.set_page_config(layout="wide")
+st.title("🐋 Institutional Flow Tracker (RSI · MACD · Dark Pools)")
+
+# =========================
+# USER INPUTS
+# =========================
+ticker = st.text_input("Ticker (AAPL, SPY, ES=F, BTC-USD)", "SPY")
+period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"])
+interval = st.selectbox("Interval", ["1d", "1wk"])
+
+# =========================
+# DATA DOWNLOAD
+# =========================
+df = yf.download(ticker, period=period, interval=interval)
+
+# 🔴 CRITICAL FIX — flatten yfinance MultiIndex
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
+
+df = df.dropna()
+
+# =========================
+# RSI
+# =========================
+delta = df["Close"].diff()
+gain = delta.clip(lower=0)
+loss = -delta.clip(upper=0)
+rs = gain.rolling(14).mean() / loss.rolling(14).mean()
+df["RSI"] = 100 - (100 / (1 + rs))
+
+# =========================
+# MACD
+# =========================
+df["EMA12"] = df["Close"].ewm(span=12, adjust=False).mean()
+df["EMA26"] = df["Close"].ewm(span=26, adjust=False).mean()
+df["MACD"] = df["EMA12"] - df["EMA26"]
+df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+df["Hist"] = df["MACD"] - df["Signal"]
+
+# =========================
+# VWAP (Institutional Price)
+# =========================
+tp = (df["High"] + df["Low"] + df["Close"]) / 3
+df["VWAP"] = (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+# =========================
+# OBV (Flow)
+# =========================
+df["OBV"] = np.where(
+    df["Close"] > df["Close"].shift(1),
+    df["Volume"],
+    np.where(df["Close"] < df["Close"].shift(1), -df["Volume"], 0)
+).cumsum()
+
+# =========================
+# Whale Volume Detection
+# =========================
+df["Vol_Avg"] = df["Volume"].rolling(20).mean()
+df["Whale"] = df["Volume"] > df["Vol_Avg"] * 2
+
+# =========================
+# Dark Pool Proxy Logic
+# =========================
+df["Body"] = abs(df["Close"] - df["Open"])
+df["Range"] = df["High"] - df["Low"]
+df["Body_Ratio"] = df["Body"] / df["Range"]
+df["VWAP_Diff"] = abs(df["Close"] - df["VWAP"]) / df["VWAP"]
+df["OBV_Slope"] = df["OBV"].diff()
+
+df["DarkPool_Accum"] = (
+    (df["Volume"] > df["Vol_Avg"] * 1.8) &
+    (df["Body_Ratio"] < 0.35) &
+    (df["VWAP_Diff"] < 0.003) &
+    (df["OBV_Slope"] > 0)
+)
+
+df["DarkPool_Dist"] = (
+    (df["Volume"] > df["Vol_Avg"] * 1.8) &
+    (df["Body_Ratio"] < 0.35) &
+    (df["VWAP_Diff"] < 0.003) &
+    (df["RSI"] > 65)
+)
+
+# =========================
+# PRICE CHART
+# =========================
+fig_price = go.Figure()
+
+fig_price.add_candlestick(
+    x=df.index,
+    open=df["Open"],
+    high=df["High"],
+    low=df["Low"],
+    close=df["Close"],
+    name="Price"
+)
+
+fig_price.add_trace(go.Scatter(
+    x=df.index,
+    y=df["VWAP"],
+    name="VWAP (Institutional)",
+    line=dict(width=2)
+))
+
+fig_price.add_trace(go.Scatter(
+    x=df[df["Whale"]].index,
+    y=df[df["Whale"]]["High"],
+    mode="markers",
+    marker=dict(size=10),
+    name="🐋 Whale Volume"
+))
+
+fig_price.add_trace(go.Scatter(
+    x=df[df["DarkPool_Accum"]].index,
+    y=df[df["DarkPool_Accum"]]["Low"],
+    mode="markers",
+    marker=dict(size=12, symbol="triangle-up"),
+    name="🟢 Dark Pool Accumulation"
+))
+
+fig_price.add_trace(go.Scatter(
+    x=df[df["DarkPool_Dist"]].index,
+    y=df[df["DarkPool_Dist"]]["High"],
+    mode="markers",
+    marker=dict(size=12, symbol="triangle-down"),
+    name="🔴 Dark Pool Distribution"
+))
+
+fig_price.update_layout(height=650, xaxis_rangeslider_visible=False)
+
+# =========================
+# RSI
+# =========================
+fig_rsi = go.Figure()
+fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI"))
+fig_rsi.add_hline(y=70, line_dash="dash")
+fig_rsi.add_hline(y=30, line_dash="dash")
+fig_rsi.update_layout(height=400)
+
+# =========================
+# MACD
+# =========================
+fig_macd = go.Figure()
+fig_macd.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD"))
+fig_macd.add_trace(go.Scatter(x=df.index, y=df["Signal"], name="Signal"))
+fig_macd.add_bar(x=df.index, y=df["Hist"], name="Histogram")
+fig_macd.update_layout(height=400)
+
+# =========================
+# OBV
+# =========================
+fig_obv = go.Figure()
+fig_obv.add_trace(go.Scatter(x=df.index, y=df["OBV"], name="OBV Flow"))
+fig_obv.update_layout(height=400)
+
+# =========================
+# DISPLAY
+# =========================
+st.plotly_chart(fig_price, use_container_width=True)
+st.plotly_chart(fig_rsi, use_container_width=True)
+st.plotly_chart(fig_macd, use_container_width=True)
+st.plotly_chart(fig_obv, use_container_width=True)
